@@ -14,6 +14,7 @@ PAGES = {
     'recipes': ('Recipes/recipes.json', OUTPUT_DIR / "recipes.md"),
     'spiritessence': ('SpiritEssence/spiritessence.json', OUTPUT_DIR / "spiritessences.md"),
     'stations': (None, OUTPUT_DIR / 'crafting-stations.md'),  # special case
+    'flags': (None, OUTPUT_DIR / 'flags.md'),  # Flags page
 }
 
 # Per-enum file definitions: map enum name to its C# file
@@ -21,6 +22,7 @@ ENUM_FILES = {
     'ItemType': ENUM_DATA_DIR / 'Items/ItemType.cs',
     'SpiritType': ENUM_DATA_DIR / 'Spirits/SpiritType.cs',
     'SpiritTier': ENUM_DATA_DIR / 'Spirits/SpiritTier.cs',
+    'ItemFlags': ENUM_DATA_DIR / 'Items/ItemFlags.cs',
 }
 
 # Ensure docs directory exists
@@ -35,14 +37,17 @@ def load_json(filepath: Path):
 
 def parse_cs_enums(enum_files):
     """
-    Parse C# enums from individual files. Returns a dict:
-    { enum_name: { int_value: name, ... } }
+    Parse C# enums (including [Flags]) from individual files.
+    Returns dict: { enum_name: { int_value: name, ... } }
     """
     enums = {}
     for enum_name, filepath in enum_files.items():
         mapping = {}
-        if filepath.exists():
+        if filepath and filepath.exists():
             text = filepath.read_text(encoding='utf-8-sig')
+            # remove [Flags] attribute if present
+            text = re.sub(r'\[Flags\]', '', text)
+            # match enum blocks
             pattern = rf'enum\s+{enum_name}\s*\{{([^}}]+)\}}'
             m = re.search(pattern, text)
             if m:
@@ -52,13 +57,19 @@ def parse_cs_enums(enum_files):
                     line = part.strip()
                     if not line:
                         continue
+                    # handle explicit value or shift expression
                     if '=' in line:
                         name_str, val_str = map(str.strip, line.split('='))
                         name = name_str
                         try:
-                            value = int(val_str)
-                        except ValueError:
-                            value = int(val_str, 0)
+                            # evaluate bit shift if present
+                            val = val_str.replace('1 <<', '1<<')
+                            value = eval(val)
+                        except Exception:
+                            try:
+                                value = int(val_str, 0)
+                            except ValueError:
+                                value = value
                     else:
                         name = re.split(r'\s', line)[0]
                     mapping[value] = name
@@ -66,14 +77,26 @@ def parse_cs_enums(enum_files):
         enums[enum_name] = mapping
     return enums
 
-# Load all enum mappings
+# Load enum mappings
 enum_maps = parse_cs_enums(ENUM_FILES)
 
-# Helper to format "Name (Id)"
+# Helpers to format enums
 def fmt_enum(enum_name, id_val):
     mapping = enum_maps.get(enum_name, {})
     name = mapping.get(id_val)
     return f"{name or id_val} ({id_val})"
+
+# For flags, decompose bitmask
+def fmt_flags_details(enum_name, mask):
+    mapping = enum_maps.get(enum_name, {})
+    details = []
+    for bit, name in mapping.items():
+        if bit != 0 and (mask & bit) == bit:
+            details.append((name, bit))
+    if not details:
+        # None flag
+        details.append((mapping.get(0, 'None'), 0))
+    return details
 
 
 def slugify(text: str) -> str:
@@ -101,47 +124,67 @@ def write_markdown(path: Path, content: str):
         f.write(content)
 
 
+# Build indexes: by itemId, by station, by flag bit for recipes, and for items
 def generate_recipe_index(recipes):
-    by_id = {}
-    by_station = {}
+    by_id, by_station, flag_map = {}, {}, {}
     for rec in recipes:
         rid = rec['recipeId']
-        rec_slug = slugify(rid)
+        slug = slugify(rid)
         title = rid.replace('_', ' ').replace(':', ' ')
-        key = rec['result']['itemId']
-        by_id.setdefault(key, []).append((rec_slug, title))
-        for inp in rec.get('requiredItems', {}):
-            by_id.setdefault(inp, []).append((rec_slug, title))
-        for inp in rec.get('requiredSpiritEssences', {}):
-            by_id.setdefault(inp, []).append((rec_slug, title))
+        # outputs/inputs
+        out_id = rec['result']['itemId']
+        by_id.setdefault(out_id, []).append((slug, title))
+        for inp in rec.get('requiredItems', {}): by_id.setdefault(inp, []).append((slug, title))
+        for inp in rec.get('requiredSpiritEssences', {}): by_id.setdefault(inp, []).append((slug, title))
+        # station
         station = rec.get('craftingStationTag', 'Unknown')
-        by_station.setdefault(station, []).append((rec_slug, title))
-    return by_id, by_station
+        by_station.setdefault(station, []).append((slug, title))
+        # recipe flags
+        flags = rec['result'].get('flags')
+        if flags is not None:
+            for name, bit in fmt_flags_details('ItemFlags', flags):
+                flag_map.setdefault(bit, {'recipes': [], 'items': []})['recipes'].append((slug, title))
+    return by_id, by_station, flag_map
+
+# Build item flags map
+def generate_item_flags_map(items):
+    item_map = {}
+    for item in items:
+        mask = item.get('flags')
+        if mask is not None:
+            name = item['name']
+            slug = slugify(name)
+            for flag_name, bit in fmt_flags_details('ItemFlags', mask):
+                item_map.setdefault(bit, []).append((slug, name))
+    return item_map
 
 
 def generate_items_page(by_id, by_station):
     items = load_json(DATA_DIR / PAGES['items'][0])
-    md = front_matter('items', 'All Items', 'items', 'Comprehensive list of all items', sidebar_position=1)
+    md = front_matter('items', 'All Items', 'items', 'All game items', 1)
     md += '# Items\n\n'
     for item in items:
-        name = item['name']
-        it_id = item['itemId']
-        type_id = item.get('type', 0)
-
-        md += f"## {name}\n"
+        md += f"## {item['name']}\n\n"
         md += f"{item['description']}\n\n"
-        # Correctly formatted admonition
-        md += ":::info\n"
-        md += f"**Type:** {fmt_enum('ItemType', type_id)}\n"
-        md += ":::\n\n"
-
-        # List recipes using this item
-        used = by_id.get(it_id, [])
+        # Type
+        md += ':::info\n'
+        md += f"**Type:** {fmt_enum('ItemType', item.get('type', 0))}\n"
+        md += ':::\n\n'
+        # Flags
+        flags_mask = item.get('flags')
+        if flags_mask is not None:
+            md += f"**Flags (mask):** {flags_mask}\n"
+            md += '- **Flag Details:**\n'
+            for name, bit in fmt_flags_details('ItemFlags', flags_mask):
+                md += f"  - [{name}](/docs/flags#{slugify(name)}) ({bit})\n"
+            md += '\n'
+        # Used in recipes
+        used = by_id.get(item['itemId'], [])
         if used:
-            md += "**Used in Recipes:**\n"
-            for rec_slug, rec_title in used:
-                md += f"- [{rec_title}](/docs/recipes#{rec_slug})\n"
-            md += "\n"
+            md += '### Used in Recipes\n'
+            for slug, title in used:
+                md += f"- [{title}](/docs/recipes#{slug})\n"
+            md += '\n'
     write_markdown(PAGES['items'][1], md)
 
 
@@ -153,11 +196,18 @@ def generate_recipes_page(by_id, by_station):
         rid = rec['recipeId']
         rec_slug = slugify(rid)
         title = rid.replace('_', ' ').replace(':', ' ')
-        md += f"## {title}\n"
+        md += f"## {title}\n\n"
         res = rec['result']
         result_id = res['itemId']
         label = result_id.replace('_', ' ').title()
         md += f"- **Result:** [{label}](/docs/items#{slugify(result_id)}) x{res['count']}\n"
+        flags = res.get('flags')
+        if flags is not None:
+            md += f"- **Flags (mask):** {flags}\n"
+            md += "  - **Flag Details:**\n"
+            for name, bit in fmt_flags_details('ItemFlags', flags):
+                slug = slugify(name)
+                md += f"    - [{name}](/docs/flags#{slug}) ({bit})\n"
         if rec.get('requiredSpiritEssences'):
             md += "- **Spirit Essences:**\n"
             for ess, qty in rec['requiredSpiritEssences'].items():
@@ -208,13 +258,36 @@ def generate_stations_page(by_id, by_station):
     write_markdown(PAGES['stations'][1], md)
 
 
+def generate_flags_page(flag_map=None, item_map=None):
+    mapping = enum_maps.get('ItemFlags', {})
+    md = front_matter('flags', 'Item Flags', 'flags', 'All item flags with associated recipes and items', 5)
+    md += '# Item Flags\n\n'
+    for bit, name in sorted(mapping.items()):
+        md += f"## {name} ({bit})\n\n"
+        # recipes
+        recs = flag_map.get(bit, {}).get('recipes', []) if flag_map else []
+        if recs:
+            md += '### Recipes with this Flag\n'
+            for slug, title in recs: md += f"- [{title}](/docs/recipes#{slug})\n"
+            md += '\n'
+        # items
+        items = item_map.get(bit, []) if item_map else []
+        if items:
+            md += '### Items with this Flag\n'
+            for slug, name in items: md += f"- [{name}](/docs/items#{slug})\n"
+            md += '\n'
+    write_markdown(PAGES['flags'][1], md)
+
 def main():
     recipes = load_json(DATA_DIR / PAGES['recipes'][0])
-    by_id, by_station = generate_recipe_index(recipes)
+    items = load_json(DATA_DIR / PAGES['items'][0])
+    by_id, by_station, flag_map = generate_recipe_index(recipes)
+    item_map = generate_item_flags_map(items)
     generate_items_page(by_id, by_station)
     generate_recipes_page(by_id, by_station)
     generate_spiritessences_page(by_id, by_station)
     generate_stations_page(by_id, by_station)
+    generate_flags_page(flag_map=flag_map, item_map=item_map)
     print('All combined Markdown pages generated.')
 
 
